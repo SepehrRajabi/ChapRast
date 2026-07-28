@@ -11,11 +11,14 @@ pub fn ChapRast(comptime T: type) type {
         // ChapRast takes ownership of the datatype being paseed to it.
         left: T,
         right: T,
+
         // we assume that the left copy is the one that being read
         read_left: atomic.Value(bool),
+
         // each reader writes to its owned cache-line; so there is no
         // coordinations according to MESI protocol
         readers_lock: []CachePadded(atomic.Value(bool)),
+        
         // all readers read a single, shared write lock, but since
         // writes are occasional, this will be in "Shared" state according
         // to MESI protocol. the only cost is for reader registeration time.
@@ -123,7 +126,6 @@ test "multi reader" {
                 // perform some computation in critical zone
                 // ...
                 if (data.* != 0x8088) {
-                    std.debug.print("HUH? {}\n", .{data.*});
                     _ = err_count.fetchAdd(1, .acq_rel);
                     return;
                 }

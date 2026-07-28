@@ -3,7 +3,7 @@ const atomic = std.atomic;
 const testing = std.testing;
 
 pub fn CachePadded(comptime T: type) type {
-    return extern struct {
+    return struct {
         inner: T align(64),
 
         const Self = @This();
