@@ -11,7 +11,11 @@ pub const Yield = enum {
     no_yield,
 };
 
-pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
+pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yield) type {
+    comptime if (!meta.hasFn(O, "apply"))
+        @compileError(@typeName(O) ++
+            " does not implement the `apply` method");
+
     return struct {
         // ChapRast takes ownership of the datatype being paseed to it.
         left: T,
@@ -29,12 +33,13 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
         // to MESI protocol. the only cost is for reader registeration time.
         write_lock: atomic.Value(bool),
 
+        logs: std.ArrayListUnmanaged(O),
         gpa: mem.Allocator,
 
         const Self = @This();
 
         pub fn init(gpa: mem.Allocator, max_readers: usize) !Self {
-            if (!meta.hasFn(T, "default"))
+            comptime if (!meta.hasFn(T, "default"))
                 @compileError(@typeName(T) ++
                     " does not implement the `default` method");
 
@@ -42,7 +47,11 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
                 CachePadded(atomic.Value(bool)),
                 max_readers,
             );
+            errdefer gpa.free(readers_lock);
             for (readers_lock) |*rl| rl.* = .init(.init(false));
+
+            const logs = try std.ArrayListUnmanaged(O).initCapacity(gpa, 8);
+            errdefer logs.deinit(gpa);
 
             return Self{
                 .left = T.default(),
@@ -50,6 +59,7 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
                 .read_left = .init(true),
                 .readers_lock = readers_lock,
                 .write_lock = .init(.init(false)),
+                .logs = logs,
                 .gpa = gpa,
             };
         }
@@ -61,18 +71,23 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
             );
             for (readers_lock) |*rl| rl.* = .init(.init(false));
 
+            const logs = try std.ArrayListUnmanaged(O).initCapacity(gpa, 8);
+            errdefer logs.deinit(gpa);
+
             return Self{
                 .left = val,
                 .right = val,
                 .read_left = .init(true),
                 .readers_lock = readers_lock,
                 .write_lock = .init(false),
+                .logs = logs,
                 .gpa = gpa,
             };
         }
 
         pub fn deinit(self: *Self) void {
             self.gpa.free(self.readers_lock);
+            self.logs.deinit(self.gpa);
         }
 
         pub fn lock(self: *Self, idx: usize) *const T {
@@ -88,8 +103,14 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
             self.readers_lock[idx].mut().store(false, .release);
         }
 
-        pub fn wpointer(self: *const Self) *T {
+        pub fn wpointer(self: *const Self) *const T {
             return if (self.read_left.load(.unordered)) &self.right else &self.left;
+        }
+
+        pub fn apply(self: *Self, op: O) !void {
+            const p = if (self.read_left.load(.unordered)) &self.right else &self.left;
+            try self.logs.append(self.gpa, op);
+            op.apply(p);
         }
 
         // publish is not thread-safe: only one publish at a time
@@ -117,13 +138,10 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
         }
 
         fn publishAssumeNoReader(self: *Self) void {
-            // copy data: for now just shallow copy.
-            // we have to store logs and reapply logs.
-            const src, const dst = if (self.read_left.load(.unordered))
-                .{ &self.left, &self.right }
-            else
-                .{ &self.right, &self.left };
-            dst.* = src.*;
+            // apply saved logs to other side
+            const dst = if (self.read_left.load(.unordered)) &self.right else &self.left;
+            for (self.logs) |op| op.apply(dst);
+            self.logs.clearRetainingCapacity();
 
             // flip pointer
             self.read_left.fetchXor(true, .unordered);
@@ -133,7 +151,16 @@ pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
 
 test "multi reader" {
     const alloc = testing.allocator;
-    var chaprast = try ChapRast(i32, .no_yield).initWithDefault(alloc, 0x8088, 16);
+
+    const I32Op = union(enum) {
+        set: i32,
+        pub fn apply(self: @This(), data: *i32) void {
+            switch (self) {
+                .set => |val| data.* = val,
+            }
+        }
+    };
+    var chaprast = try ChapRast(i32, I32Op, .no_yield).initWithDefault(alloc, 0, 16);
     defer chaprast.deinit();
 
     const ErrorCount = atomic.Value(u16);
@@ -141,18 +168,30 @@ test "multi reader" {
 
     const Reader = struct {
         fn start(
-            cr: *ChapRast(i32, .no_yield),
+            cr: *ChapRast(i32, I32Op, .no_yield),
             idx: usize,
             err_count: *ErrorCount,
         ) void {
+            var state0: bool = true;
+
             for (0..10 * 1000) |_| {
                 const data = cr.lock(idx);
                 defer cr.unlock(idx);
                 // perform some computation in critical zone
                 // ...
-                if (data.* != 0x8088) {
-                    _ = err_count.fetchAdd(1, .acq_rel);
-                    return;
+                if (state0) {
+                    if (data.* != 0x00 and data.* != 0x8088) {
+                        _ = err_count.fetchAdd(1, .acq_rel);
+                        return;
+                    }
+                    if (data.* == 0x8088) {
+                        state0 = false;
+                    }
+                } else {
+                    if (data.* != 0x8088) {
+                        _ = err_count.fetchAdd(1, .acq_rel);
+                        return;
+                    }
                 }
             }
         }
