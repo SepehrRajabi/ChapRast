@@ -6,7 +6,12 @@ const testing = std.testing;
 const Thread = std.Thread;
 const CachePadded = @import("cache_padded.zig").CachePadded;
 
-pub fn ChapRast(comptime T: type) type {
+pub const Yield = enum {
+    yield_on_wait,
+    no_yield,
+};
+
+pub fn ChapRast(comptime T: type, comptime yield_on_wait: Yield) type {
     return struct {
         // ChapRast takes ownership of the datatype being paseed to it.
         left: T,
@@ -18,7 +23,7 @@ pub fn ChapRast(comptime T: type) type {
         // each reader writes to its owned cache-line; so there is no
         // coordinations according to MESI protocol
         readers_lock: []CachePadded(atomic.Value(bool)),
-        
+
         // all readers read a single, shared write lock, but since
         // writes are occasional, this will be in "Shared" state according
         // to MESI protocol. the only cost is for reader registeration time.
@@ -72,43 +77,63 @@ pub fn ChapRast(comptime T: type) type {
 
         pub fn lock(self: *Self, idx: usize) *const T {
             while (self.write_lock.load(.acquire)) {
-                // maybe Thread.yield() here?
+                if (comptime yield_on_wait == .yield_on_wait)
+                    Thread.yield();
             }
             self.readers_lock[idx].mut().store(true, .release);
-            return self.pointer();
+            return if (self.read_left.load(.unordered)) &self.left else &self.right;
         }
 
         pub fn unlock(self: *Self, idx: usize) void {
             self.readers_lock[idx].mut().store(false, .release);
         }
 
-        pub fn pointer(self: *const Self) *const T {
-            return if (self.read_left.load(.unordered)) &self.left else &self.right;
+        pub fn wpointer(self: *const Self) *T {
+            return if (self.read_left.load(.unordered)) &self.right else &self.left;
         }
 
-        pub fn wlock(self: *Self) void {
+        // publish is not thread-safe: only one publish at a time
+        pub fn publish(self: *Self) void {
             self.write_lock.store(true, .release);
-            outer: while (true) {
+            defer self.write_lock.store(false, .release);
+            guard: while (true) {
                 for (self.readers_lock) |rl| {
-                    if (rl.ref().load(.acquire)) continue :outer;
+                    if (rl.ref().load(.acquire)) continue :guard;
                 }
                 break;
             }
+            self.publishAssumeNoReader();
         }
 
-        pub fn wunlock(self: *Self) void {
-            self.write_lock.store(.init(false), .release);
+        // tryPublish is not thread-safe: only one tryPublish at a time
+        pub fn tryPublish(self: *Self) bool {
+            self.write_lock.store(true, .release);
+            defer self.write_lock.store(false, .release);
+            for (self.readers_lock) |rl| {
+                if (rl.ref().load(.acquire)) return false;
+            }
+            self.publishAssumeNoReader();
+            return true;
         }
 
-        pub fn wpointer(self: *const Self) *T {
-            return if (self.read_left.load(.unordered)) &self.right else &self.left;
+        fn publishAssumeNoReader(self: *Self) void {
+            // copy data: for now just shallow copy.
+            // we have to store logs and reapply logs.
+            const src, const dst = if (self.read_left.load(.unordered))
+                .{ &self.left, &self.right }
+            else
+                .{ &self.right, &self.left };
+            dst.* = src.*;
+
+            // flip pointer
+            self.read_left.fetchXor(true, .unordered);
         }
     };
 }
 
 test "multi reader" {
     const alloc = testing.allocator;
-    var chaprast = try ChapRast(i32).initWithDefault(alloc, 0x8088, 16);
+    var chaprast = try ChapRast(i32, .no_yield).initWithDefault(alloc, 0x8088, 16);
     defer chaprast.deinit();
 
     const ErrorCount = atomic.Value(u16);
@@ -116,7 +141,7 @@ test "multi reader" {
 
     const Reader = struct {
         fn start(
-            cr: *ChapRast(i32),
+            cr: *ChapRast(i32, .no_yield),
             idx: usize,
             err_count: *ErrorCount,
         ) void {
