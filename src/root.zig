@@ -22,7 +22,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
         right: T,
 
         // we assume that the left copy is the one that being read
-        read_left: atomic.Value(bool),
+        read_left: atomic.Value(u8),
 
         // each reader writes to its owned cache-line; so there is no
         // coordinations according to MESI protocol
@@ -56,7 +56,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
             return Self{
                 .left = T.default(),
                 .right = T.default(),
-                .read_left = .init(true),
+                .read_left = .init(1),
                 .readers_lock = readers_lock,
                 .write_lock = .init(.init(false)),
                 .logs = logs,
@@ -77,7 +77,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
             return Self{
                 .left = val,
                 .right = val,
-                .read_left = .init(true),
+                .read_left = .init(1),
                 .readers_lock = readers_lock,
                 .write_lock = .init(false),
                 .logs = logs,
@@ -96,7 +96,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
                     Thread.yield();
             }
             self.readers_lock[idx].mut().store(true, .release);
-            return if (self.read_left.load(.unordered)) &self.left else &self.right;
+            return if (self.read_left.load(.unordered) == 1) &self.left else &self.right;
         }
 
         pub fn unlock(self: *Self, idx: usize) void {
@@ -104,11 +104,11 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
         }
 
         pub fn wpointer(self: *const Self) *const T {
-            return if (self.read_left.load(.unordered)) &self.right else &self.left;
+            return if (self.read_left.load(.unordered) == 1) &self.right else &self.left;
         }
 
         pub fn apply(self: *Self, op: O) !void {
-            const p = if (self.read_left.load(.unordered)) &self.right else &self.left;
+            const p = if (self.read_left.load(.unordered) == 1) &self.right else &self.left;
             try self.logs.append(self.gpa, op);
             op.apply(p);
         }
@@ -138,13 +138,10 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
         }
 
         fn publishAssumeNoReader(self: *Self) void {
-            // apply saved logs to other side
-            const dst = if (self.read_left.load(.unordered)) &self.right else &self.left;
-            for (self.logs) |op| op.apply(dst);
+            // flip pointer and write data
+            const dst = if (self.read_left.bitToggle(0, .acquire) == 1) &self.left else &self.right;
+            for (self.logs.items) |op| op.apply(dst);
             self.logs.clearRetainingCapacity();
-
-            // flip pointer
-            self.read_left.fetchXor(true, .unordered);
         }
     };
 }
@@ -160,50 +157,57 @@ test "multi reader" {
             }
         }
     };
-    var chaprast = try ChapRast(i32, I32Op, .no_yield).initWithDefault(alloc, 0, 16);
-    defer chaprast.deinit();
 
-    const ErrorCount = atomic.Value(u16);
-    var errors: ErrorCount = .init(0);
+    for (0..64) |_| {
+        var chaprast = try ChapRast(i32, I32Op, .no_yield).initWithDefault(alloc, 0, 16);
+        defer chaprast.deinit();
 
-    const Reader = struct {
-        fn start(
-            cr: *ChapRast(i32, I32Op, .no_yield),
-            idx: usize,
-            err_count: *ErrorCount,
-        ) void {
-            var state0: bool = true;
+        const ErrorCount = atomic.Value(u16);
+        var errors: ErrorCount = .init(0);
 
-            for (0..10 * 1000) |_| {
-                const data = cr.lock(idx);
-                defer cr.unlock(idx);
-                // perform some computation in critical zone
-                // ...
-                if (state0) {
-                    if (data.* != 0x00 and data.* != 0x8088) {
-                        _ = err_count.fetchAdd(1, .acq_rel);
-                        return;
-                    }
-                    if (data.* == 0x8088) {
-                        state0 = false;
-                    }
-                } else {
-                    if (data.* != 0x8088) {
-                        _ = err_count.fetchAdd(1, .acq_rel);
-                        return;
+        const Reader = struct {
+            fn start(
+                cr: *ChapRast(i32, I32Op, .no_yield),
+                idx: usize,
+                err_count: *ErrorCount,
+            ) void {
+                var state0: bool = true;
+
+                for (0..10 * 1000) |_| {
+                    const data = cr.lock(idx);
+                    defer cr.unlock(idx);
+                    // perform some computation in critical zone
+                    // ...
+                    if (state0) {
+                        if (data.* != 0x00 and data.* != 0x8088) {
+                            _ = err_count.fetchAdd(1, .acq_rel);
+                            return;
+                        }
+                        if (data.* == 0x8088) {
+                            state0 = false;
+                        }
+                    } else {
+                        if (data.* != 0x8088) {
+                            _ = err_count.fetchAdd(1, .acq_rel);
+                            return;
+                        }
                     }
                 }
             }
-        }
-    };
+        };
 
-    var handles: [16]Thread = undefined;
-    for (handles, 0..) |_, idx|
-        handles[idx] = try Thread.spawn(
-            .{},
-            Reader.start,
-            .{ &chaprast, idx, &errors },
-        );
-    for (handles) |h| h.join();
-    try testing.expectEqual(0, errors.load(.acquire));
+        var handles: [16]Thread = undefined;
+        for (handles, 0..) |_, idx|
+            handles[idx] = try Thread.spawn(
+                .{},
+                Reader.start,
+                .{ &chaprast, idx, &errors },
+            );
+
+        try chaprast.apply(.{ .set = 0x8088 });
+        chaprast.publish();
+
+        for (handles) |h| h.join();
+        try testing.expectEqual(0, errors.load(.acquire));
+    }
 }
