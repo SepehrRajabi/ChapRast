@@ -11,9 +11,9 @@ pub const Yield = enum {
     no_yield,
 };
 
-pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yield) type {
-    comptime if (!meta.hasFn(O, "apply"))
-        @compileError(@typeName(O) ++
+pub fn ChapRast(comptime T: type, comptime OpLogType: type, comptime yield_on_wait: Yield) type {
+    comptime if (!meta.hasFn(OpLogType, "apply"))
+        @compileError(@typeName(OpLogType) ++
             " does not implement the `apply` method");
 
     return struct {
@@ -33,7 +33,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
         // to MESI protocol. the only cost is for reader registeration time.
         write_lock: atomic.Value(bool),
 
-        logs: std.ArrayListUnmanaged(O),
+        logs: std.ArrayListUnmanaged(OpLogType),
         gpa: mem.Allocator,
 
         const Self = @This();
@@ -50,7 +50,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
             errdefer gpa.free(readers_lock);
             for (readers_lock) |*rl| rl.* = .init(.init(false));
 
-            const logs = try std.ArrayListUnmanaged(O).initCapacity(gpa, 8);
+            const logs = try std.ArrayListUnmanaged(OpLogType).initCapacity(gpa, 8);
             errdefer logs.deinit(gpa);
 
             return Self{
@@ -71,7 +71,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
             );
             for (readers_lock) |*rl| rl.* = .init(.init(false));
 
-            const logs = try std.ArrayListUnmanaged(O).initCapacity(gpa, 8);
+            const logs = try std.ArrayListUnmanaged(OpLogType).initCapacity(gpa, 8);
             errdefer logs.deinit(gpa);
 
             return Self{
@@ -107,7 +107,7 @@ pub fn ChapRast(comptime T: type, comptime O: type, comptime yield_on_wait: Yiel
             return if (self.read_left.load(.unordered) == 1) &self.right else &self.left;
         }
 
-        pub fn apply(self: *Self, op: O) !void {
+        pub fn apply(self: *Self, op: OpLogType) !void {
             const p = if (self.read_left.load(.unordered) == 1) &self.right else &self.left;
             try self.logs.append(self.gpa, op);
             op.apply(p);
